@@ -1,143 +1,139 @@
-#define __SFR_OFFSET 0x00
-#include "avr/io.h"
+; AVR.S - Estacion meteorologica
+#define __SFR_OFFSET 0
+#include <avr/io.h>
+
+.equ PIN_LED,   4        ; PB4 (D12)
+.equ PIN_TRIG,  7        ; PD7 (D7)
+.equ PIN_ECHO,  6        ; PD6 (D6)
+
+.equ LIM_INICIO_ECHO, 30000   ; iteraciones de 6 ciclos (~11 ms) esperando que Echo suba
+.equ LIM_ECHO_US,     25000   ; ancho maximo de eco (us), ~430 cm
+.equ DIST_ERROR,      0xFFFF
 
 .global init_ports_asm
-.global read_adc_ldr_asm
-.global read_adc_wind_asm
+.global leer_adc
+.global escalar_adc
 .global medir_distancia
+.global led_alerta
 
-; =====================================================================
-; INICIALIZACIÓN DE PUERTOS Y ADC
-; =====================================================================
+; init_ports_asm : pines digitales y ADC
 init_ports_asm:
-    ; Trig en D7 (PD7) como SALIDA
-    sbi 0x0A, 7         ; DDRD |= (1<<7)
-    ; Echo en D6 (PD6) como ENTRADA
-    cbi 0x0A, 6         ; DDRD &= ~(1<<6)
-    
-    ; Inicializar ADC (Habilitar y configurar prescaler)
-    ldi r24, 0x40       ; ADMUX = AVCC, Canal 0
-    sts 0x7C, r24
-    ldi r24, 0x87       ; ADCSRA = Habilitar, Prescaler 128
-    sts 0x7A, r24
-    ret
+    SBI  DDRD,  PIN_TRIG      ; Trig salida
+    CBI  PORTD, PIN_TRIG      ; Trig en bajo
+    CBI  DDRD,  PIN_ECHO      ; Echo entrada
+    SBI  DDRB,  PIN_LED       ; LED alerta salida
+    CBI  PORTB, PIN_LED       ; apagado
+    LDI  R18, (1<<REFS0)                                  ; AVcc, canal 0
+    STS  ADMUX, R18
+    LDI  R18, (1<<ADEN)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0) ; ADC on, prescaler 128
+    STS  ADCSRA, R18
+    RET
 
-; =====================================================================
-; LECTURA DEL ADC (LDR en A0)
-; =====================================================================
-read_adc_ldr_asm:
-    ldi r24, 0x40       ; ADMUX = AVCC, Canal 0
-    sts 0x7C, r24
-    ldi r24, 0x87       ; ADCSRA = Iniciar conversión
-    sts 0x7A, r24
-wait_adc_ldr:
-    lds r24, 0x7A
-    sbrc r24, 6         ; Esperar a que ADSC sea 0
-    rjmp wait_adc_ldr
-    lds r24, 0x78       ; ADCL
-    lds r25, 0x79       ; ADCH
-    ret
+; uint16_t leer_adc(uint8_t canal)     canal en R24 (0 = A0, 1 = A1, ...)
+; Retorna 10 bits en R25:R24. La primera conversion se descarta
+; (asentamiento del multiplexor al cambiar de canal).
+leer_adc:
+    ANDI R24, 0x0F
+    ORI  R24, (1<<REFS0)
+    STS  ADMUX, R24
+    LDI  R19, 2
+leer_adc_conv:
+    LDI  R18, (1<<ADEN)|(1<<ADSC)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0) ; 0xC7: inicia conversion
+    STS  ADCSRA, R18
+leer_adc_espera:
+    LDS  R18, ADCSRA
+    SBRC R18, ADSC            ; esperar a que ADSC sea 0
+    RJMP leer_adc_espera
+    DEC  R19
+    BRNE leer_adc_conv
+    LDS  R24, ADCL            ; ADCL siempre antes que ADCH
+    LDS  R25, ADCH
+    RET
 
-; =====================================================================
-; LECTURA DEL ADC (Motor/Viento en A1) - CORREGIDO con Dummy Read
-; =====================================================================
-read_adc_wind_asm:
-    ldi r24, 0x41       ; ADMUX = AVCC, Canal 1
-    sts 0x7C, r24
-    ldi r24, 0x87       ; Iniciar primera conversión (dummy)
-    sts 0x7A, r24
-wait_dummy_wind:
-    lds r24, 0x7A
-    sbrc r24, 6
-    rjmp wait_dummy_wind
-    
-    ldi r24, 0x87       ; Iniciar segunda conversión (real)
-    sts 0x7A, r24
-wait_adc_wind:
-    lds r24, 0x7A
-    sbrc r24, 6
-    rjmp wait_adc_wind
-    lds r24, 0x78       ; ADCL
-    lds r25, 0x79       ; ADCH
-    ret
+; uint16_t escalar_adc(uint16_t raw, uint8_t k)   raw = R25:R24, k = R22
+; Retorna (raw * k) >> 8
+escalar_adc:
+    MUL  R24, R22
+    MOV  R18, R1
+    MUL  R25, R22
+    ADD  R18, R0
+    CLR  R19
+    ADC  R1, R19
+    MOV  R24, R18
+    MOV  R25, R1
+    CLR  R1                   ; R1 debe quedar en 0
+    RET
 
-; =====================================================================
-; MEDIR DISTANCIA (HC-SR04) - CORREGIDO (sbis y límite de división)
-; =====================================================================
+; uint16_t medir_distancia(void)
+; Retorna cm en R25:R24, o 0xFFFF si no hubo eco / fuera de rango.
+; Cada vuelta del lazo de conteo dura 16 ciclos = 1 us.
 medir_distancia:
-    ; 1. Pulso de 10us en Trig
-    sbi 0x0B, 7         ; PORTD |= (1<<7)
-    ldi r20, 80
-dly_trig:
-    dec r20
-    brne dly_trig
-    cbi 0x0B, 7         ; PORTD &= ~(1<<7)
+    SBI  PORTD, PIN_TRIG      ; pulso de disparo (>= 10 us)
+    LDI  R20, 80              ; 80 * 3 ciclos = 15 us
+dist_trig:
+    DEC  R20
+    BRNE dist_trig
+    CBI  PORTD, PIN_TRIG
 
-    ; 2. Esperar a que Echo suba a HIGH (con timeout)
-    ldi r26, 0
-    ldi r27, 0
-wait_echo_high:
-    sbis 0x09, 6        ; Si PIND6 es 1, salta a echo_started
-    rjmp check_timeout
-    rjmp echo_started
-check_timeout:
-    adiw r26, 1
-    cpi r26, 0xFF
-    brne wait_echo_high
-    cpi r27, 0xFF       ; Timeout más largo (aprox 20ms)
-    brne wait_echo_high
-    
-    ; Timeout alcanzado
-    ldi r24, 0
-    ldi r25, 0
-    ret
+    LDI  R26, lo8(LIM_INICIO_ECHO)
+    LDI  R27, hi8(LIM_INICIO_ECHO)
+dist_espera_eco:
+    SBIC PIND, PIN_ECHO       ; Echo en BAJO -> salta
+    RJMP dist_eco_alto        ; Echo en ALTO -> empezar a contar
+    SBIW R26, 1
+    BRNE dist_espera_eco
+    RJMP dist_timeout
 
-    ; 3. Contar tiempo que Echo se mantiene en HIGH (CORREGIDO)
-echo_started:
-    ldi r24, 0
-    ldi r25, 0
-count_echo:
-    sbis 0x09, 6        ; Si PIND6 es 1, salta el rjmp
-    rjmp echo_low       ; Si es 0, salir del ciclo
-    adiw r24, 1
-    rjmp count_echo
+dist_eco_alto:
+    CLR  R24
+    CLR  R25
+    LDI  R22, lo8(LIM_ECHO_US)
+    LDI  R23, hi8(LIM_ECHO_US)
+dist_cuenta:                  ; 2+2+1+1+1+1+6+2 = 16 ciclos
+    SBIS PIND, PIN_ECHO       ; 2  Echo en ALTO -> salta
+    RJMP dist_fin_eco
+    ADIW R24, 1               ; 2
+    CP   R24, R22             ; 1
+    CPC  R25, R23             ; 1
+    BRSH dist_timeout         ; 1
+    NOP                       ; 1
+    RJMP .+0                  ; 2
+    RJMP .+0                  ; 2
+    RJMP .+0                  ; 2
+    RJMP dist_cuenta          ; 2
 
-echo_low:
-    ; 4. Convertir a cm (Distancia = Tiempo / 58)
-    ; CORREGIDO: Revisar si el tiempo es 0 mirando ambos bytes
-    cpi r25, 0
-    brne hacer_division
-    cpi r24, 50
-    brlo error_dist
-hacer_division:
-    ldi r18, 58
-    rcall dividir_16_8
-    ret
-error_dist:
-    ldi r24, 0
-    ldi r25, 0
-    ret
+dist_fin_eco:
+    LDI  R18, 58              ; cm = us / 58
+    RJMP dividir_16_8         ; vuelve al llamador con el resultado en R25:R24
 
-; =====================================================================
-; RUTINA DE DIVISIÓN
-; =====================================================================
+dist_timeout:
+    LDI  R24, 0xFF
+    LDI  R25, 0xFF
+    RET
+
+; dividir_16_8 (interna): R25:R24 / R18 -> cociente R25:R24, resto R21
 dividir_16_8:
-    ldi r20, 16
-    clr r21
+    CLR  R21
+    LDI  R20, 16
 div_loop:
-    lsl r24
-    rol r25
-    rol r21
-    sub r21, r18
-    brcc div_ok
-    add r21, r18
-    clc
-    rjmp div_next
-div_ok:
-    sec
-div_next:
-    rol r24
-    rol r25
-    dec r20
-    brne div_loop
-    ret
+    LSL  R24
+    ROL  R25
+    ROL  R21
+    CP   R21, R18
+    BRLO div_siguiente
+    SUB  R21, R18
+    ORI  R24, 1
+div_siguiente:
+    DEC  R20
+    BRNE div_loop
+    RET
+
+; void led_alerta(uint8_t encendido)    R24 != 0 enciende el LED (D12)
+led_alerta:
+    TST  R24
+    BREQ led_apagar
+    SBI  PORTB, PIN_LED
+    RET
+led_apagar:
+    CBI  PORTB, PIN_LED
+    RET
